@@ -1,0 +1,12 @@
+[Unit]
+Description=keytypist WPM keyboard backlight driver
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/lukedaduke/Documents/github/personal/keytypist/wpm-backlight.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
