@@ -2,9 +2,10 @@
 """
 keytypist - live next-key prediction TUI.
 
-Supports two engines:
+Supports three engines:
 - ngram: a tiny in-memory character n-gram trained from local typing history.
 - llama: llama-cpp-python with a local .gguf model.
+- llama-server: local llama.cpp HTTP server with a .gguf model.
 
 All keystrokes and predictions are stored in a local SQLite database.
 """
@@ -13,11 +14,16 @@ from __future__ import annotations
 
 import argparse
 import curses
+import json
 import logging
 import math
+import shutil
 import sqlite3
+import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from collections import Counter, defaultdict
 from collections.abc import Sequence
 from pathlib import Path
@@ -89,10 +95,23 @@ def _build_key_maps() -> tuple[dict[str, str], set[str]]:
 CHAR_TO_KEY, ALL_LABELS = _build_key_maps()
 
 
+def _display_for(label: str) -> str:
+    return LABEL_DISPLAY.get(label, label)
+
+
+def _thread_count() -> int:
+    import os
+
+    return os.cpu_count() or 1
+
+
 class Engine(Protocol):
     """Pluggable prediction backend."""
 
     def predict(self, context: str, top_k: int = TOP_K) -> list[tuple[str, float]]:
+        ...
+
+    def close(self) -> None:
         ...
 
 
@@ -125,6 +144,9 @@ class NgramEngine:
                 items = counter.most_common(top_k)
                 return [(c, n / total) for c, n in items]
         return []
+
+    def close(self) -> None:
+        pass
 
 
 class LlamaCppEngine:
@@ -196,11 +218,133 @@ class LlamaCppEngine:
                 break
         return predictions
 
+    def close(self) -> None:
+        pass
 
-def _thread_count() -> int:
-    import os
 
-    return os.cpu_count() or 1
+class LlamaServerEngine:
+    """Local llama.cpp HTTP server with a .gguf model."""
+
+    def __init__(
+        self,
+        model_path: Path,
+        host: str = "127.0.0.1",
+        port: int = 8080,
+        n_ctx: int = 512,
+        n_gpu_layers: int = -1,
+    ) -> None:
+        self.model_path = model_path
+        self.host = host
+        self.port = port
+        self.base_url = f"http://{host}:{port}"
+        self.n_ctx = n_ctx
+
+        binary = shutil.which("llama-server")
+        if not binary:
+            raise FileNotFoundError(
+                "llama-server not found in PATH. Install llama.cpp (e.g. 'brew install llama.cpp')"
+            )
+
+        cmd = [
+            binary,
+            "-m", str(model_path),
+            "-c", str(n_ctx),
+            "--host", host,
+            "--port", str(port),
+        ]
+        if n_gpu_layers > 0:
+            cmd.extend(["-ngl", str(n_gpu_layers)])
+        elif n_gpu_layers < 0:
+            cmd.extend(["-ngl", "99"])
+
+        logging.info("Starting llama-server: %s", " ".join(cmd))
+        self.proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        self._wait_for_server(timeout=120)
+
+    def _wait_for_server(self, timeout: int = 120) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                raise RuntimeError("llama-server exited before becoming ready")
+            try:
+                req = urllib.request.Request(f"{self.base_url}/health", method="GET")
+                with urllib.request.urlopen(req, timeout=1) as resp:
+                    if resp.status == 200:
+                        logging.info("llama-server ready.")
+                        return
+            except urllib.error.URLError:
+                pass
+            time.sleep(0.2)
+        raise TimeoutError(f"llama-server did not become ready within {timeout}s")
+
+    def predict(self, context: str, top_k: int = TOP_K) -> list[tuple[str, float]]:
+        prompt = context[-(self.n_ctx - 10) :]
+        if not prompt:
+            return []
+
+        payload = {
+            "prompt": prompt,
+            "n_predict": 1,
+            "n_probs": top_k * 3,
+            "temperature": 0.0,
+            "top_k": 0,
+            "cache_prompt": True,
+        }
+
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.base_url}/completion",
+            method="POST",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                result = json.load(resp)
+        except urllib.error.URLError as e:
+            logging.exception("llama-server request failed")
+            raise
+
+        completion_probs = result.get("completion_probabilities", [])
+        if not completion_probs:
+            return []
+
+        top_logprobs = completion_probs[0].get("top_logprobs", [])
+        predictions: list[tuple[str, float]] = []
+        seen: set[str] = set()
+        for item in top_logprobs:
+            token = item.get("token", "")
+            logp = item.get("logprob", float("-inf"))
+            text = token.strip().lower()
+            if not text:
+                continue
+            ch = text[0]
+            if ch in seen or ch not in CHAR_TO_KEY:
+                continue
+            seen.add(ch)
+            try:
+                prob = math.exp(logp)
+            except OverflowError:
+                prob = 0.0
+            predictions.append((ch, prob))
+            if len(predictions) >= top_k:
+                break
+        return predictions
+
+    def close(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
 
 
 class Database:
@@ -328,10 +472,6 @@ def _safe_addstr(scr: curses.window, y: int, x: int, text: str, attr: int = 0) -
         pass
 
 
-def _display_for(label: str) -> str:
-    return LABEL_DISPLAY.get(label, label)
-
-
 def _draw_key(
     scr: curses.window, y: int, x: int, width: int, label: str, attr: int
 ) -> None:
@@ -448,12 +588,14 @@ def _main_tui(stdscr: curses.window, engine: Engine, db: Database) -> None:
         curses.init_pair(3, curses.COLOR_BLUE, -1)
         curses.init_pair(4, curses.COLOR_YELLOW, -1)
 
-    engine_name = getattr(engine, "model_path", "ngram")
-    if not isinstance(engine_name, str):
-        engine_name = "llama"
+    engine_name = getattr(engine, "model_path", None)
+    if engine_name is None:
+        engine_name = "ngram"
+    else:
+        engine_name = Path(engine_name).name
     session_id = db.start_session(
         engine="ngram" if isinstance(engine, NgramEngine) else "llama",
-        model_path=str(engine_name) if isinstance(engine_name, Path) else None,
+        model_path=str(engine_name) if not isinstance(engine, NgramEngine) else None,
     )
 
     buffer = ""
@@ -463,7 +605,7 @@ def _main_tui(stdscr: curses.window, engine: Engine, db: Database) -> None:
     while True:
         stdscr.clear()
         predictions = engine.predict(buffer, top_k=TOP_K)
-        db.log_predictions(session_id, buffer, "ngram" if isinstance(engine, NgramEngine) else "llama", predictions)
+        db.log_predictions(session_id, buffer, str(engine_name), predictions)
         _draw_header(stdscr, buffer, predictions, mode, dirty, str(engine_name))
         _draw_keyboard(stdscr, predictions, mode)
         stdscr.refresh()
@@ -519,7 +661,19 @@ def _build_engine(args: argparse.Namespace) -> Engine:
             raise FileNotFoundError(
                 "--model /path/to/model.gguf is required for --engine llama"
             )
-        return LlamaCppEngine(args.model)
+        return LlamaCppEngine(args.model, n_gpu_layers=args.n_gpu_layers)
+
+    if args.engine == "llama-server":
+        if not args.model or not args.model.exists():
+            raise FileNotFoundError(
+                "--model /path/to/model.gguf is required for --engine llama-server"
+            )
+        return LlamaServerEngine(
+            args.model,
+            host=args.host,
+            port=args.port,
+            n_gpu_layers=args.n_gpu_layers,
+        )
 
     raise ValueError(f"unknown engine: {args.engine}")
 
@@ -528,6 +682,7 @@ def _smoke(engine: Engine) -> None:
     logging.info("Smoke test with %s", type(engine).__name__)
     print("predict('the q'):", engine.predict("the q"))
     print("predict('hello '):", engine.predict("hello "))
+    engine.close()
 
 
 def main() -> int:
@@ -535,7 +690,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="keytypist next-key prediction TUI")
     parser.add_argument(
         "--engine",
-        choices=["ngram", "llama"],
+        choices=["ngram", "llama", "llama-server"],
         default="ngram",
         help="prediction engine",
     )
@@ -543,7 +698,24 @@ def main() -> int:
         "--model",
         type=Path,
         default=None,
-        help="path to .gguf model for --engine llama",
+        help="path to .gguf model for llama or llama-server",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="llama-server host",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="llama-server port",
+    )
+    parser.add_argument(
+        "--n-gpu-layers",
+        type=int,
+        default=-1,
+        help="GPU layers for llama engines (-1 = all)",
     )
     parser.add_argument(
         "--db",
@@ -576,6 +748,7 @@ def main() -> int:
         raise
     finally:
         db.close()
+        engine.close()
     return 0
 
 
