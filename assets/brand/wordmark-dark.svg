@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 250 64" width="250" height="64" role="img" aria-label="keytypist">
+
+  <rect x="4" y="4" width="56" height="56" rx="12" fill="none" stroke="#F2EBDD" stroke-width="5"/>
+  <rect x="14" y="12" width="36" height="30" rx="6" fill="none" stroke="#F2EBDD" stroke-width="3" opacity=".45"/>
+  <rect x="30" y="18" width="5" height="20" rx="2.5" fill="#F5A623"/>
+  <rect x="16" y="47" width="32" height="4" rx="2" fill="#F5A623"/>
+<g fill="none" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+<path transform="translate(78 0)" d="M0 14V46M12 26L0 38M4 34L12 46" stroke="#F2EBDD"/>
+<path transform="translate(96 0)" d="M0 36H12V32Q12 26 6 26Q0 26 0 32V40Q0 46 6 46H12" stroke="#F2EBDD"/>
+<path transform="translate(114 0)" d="M0 26L6 42M12 26L4 58" stroke="#F2EBDD"/>
+<path transform="translate(132 0)" d="M5 16V40Q5 46 11 46M0 26H11" stroke="#F5A623"/>
+<path transform="translate(150 0)" d="M0 26L6 42M12 26L4 58" stroke="#F5A623"/>
+<path transform="translate(168 0)" d="M0 26V58M0 32Q0 26 6 26H8Q12 26 12 32V40Q12 46 8 46H6Q0 46 0 40" stroke="#F5A623"/>
+<path transform="translate(186 0)" d="M6 26V46M6 15V15.5" stroke="#F5A623"/>
+<path transform="translate(204 0)" d="M12 28Q12 26 9 26H4Q0 26 0 30Q0 36 6 36Q12 36 12 42Q12 46 8 46H3Q0 46 0 44" stroke="#F5A623"/>
+<path transform="translate(222 0)" d="M5 16V40Q5 46 11 46M0 26H11" stroke="#F5A623"/>
+</g>
+</svg>
